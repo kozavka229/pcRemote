@@ -1,0 +1,2 @@
+aio-pika~=9.5.7
+prompt_toolkit~=3.0.51
