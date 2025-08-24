@@ -25,3 +25,5 @@ pip install -r client-req.txt
 5. Run send.py on third pc (or terminal session): ``` python send.py <room> ```
 
 All commands (and keys) from send.py (third pc) will send to exec.py (second pc) and will execute there.
+
+PS: root password 1234
