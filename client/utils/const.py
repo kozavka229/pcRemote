@@ -1,0 +1,9 @@
+EXIT = b'<EXIT>'
+PING = b'<PING>'
+PONG = b'<PONG>'
+
+COMMANDS_QUEUE = "commands"
+LOG_QUEUE = "logs"
+
+BYTES_READ = 1024  # 1KB
+BUFFER_MAX_SIZE = 512 * 1024  # 512KB

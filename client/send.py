@@ -1,128 +1,109 @@
 import asyncio
+import sys
+import termios
+import tty
 
-import aio_pika
-from aio_pika.abc import AbstractConnection, AbstractChannel, AbstractQueue
+import readchar
+from aio_pika.abc import AbstractConnection, AbstractChannel
 
-from prompt_toolkit.application import Application
-from prompt_toolkit.document import Document
-from prompt_toolkit.key_binding import KeyBindings
-from prompt_toolkit.layout.containers import HSplit, Window
-from prompt_toolkit.layout.layout import Layout
-from prompt_toolkit.styles import Style
-from prompt_toolkit.widgets import TextArea
-
+from utils import logger, short_pika, const
+from utils import colorize, COLOR
 import config
 
-
-class Sender:
-    PRODUCER_QUEUE = config.COMMANDS_QUEUE
-    CONSUMER_QUEUE = config.LOG_QUEUE
-
-    def __init__(self):
-        self.__conn: AbstractConnection | None = None
-        self.__channel: AbstractChannel | None = None
-        self.__consumer_queue: AbstractQueue | None = None
-
-    @property
-    def connection(self) -> AbstractConnection:
-        return self.__conn
-
-    @property
-    def channel(self) -> AbstractChannel:
-        return self.__channel
-
-    async def setup(self) -> bool:
-        self.__conn, connected = await config.connect()
-        if not connected:
-            return False
-
-        self.__channel = await self.__conn.channel()
-        await self.__channel.declare_queue(self.PRODUCER_QUEUE)
-        self.__consumer_queue = await self.__channel.declare_queue(self.CONSUMER_QUEUE)
-        self.log("Connected\n")
-        return True
-
-    async def execute(self, text: str):
-        await self.__publish(text.encode())
-
-    async def consume(self):
-        async with self.__consumer_queue.iterator() as queue_iter:
-
-            async for message in queue_iter:
-                message: aio_pika.abc.AbstractIncomingMessage
-                async with message.process():
-                    self.log(message.body.decode())
-
-    def log(self, message: str):
-        print(message, end="")
-
-    async def __publish(self, message: bytes):
-        await self.__channel.default_exchange.publish(aio_pika.Message(message), routing_key=self.PRODUCER_QUEUE)
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        await self.__conn.close()
+EXIT_KEY = readchar.key.CTRL_L
 
 
-class ApplicationLogSender(Sender):
-    def __init__(self):
-        super().__init__()
+PRODUCER_QUEUE = const.COMMANDS_QUEUE
+CONSUMER_QUEUE = const.LOG_QUEUE
 
-        output_field = TextArea(style="class:output-field")
-        input_field = TextArea(height=1, prompt=">>> ", style="class:input-field", multiline=False, wrap_lines=False)
+readchar.config.INTERRUPT_KEYS = []
 
-        container = HSplit([output_field, Window(height=1, char="-", style="class:line"), input_field])
 
-        input_field.accept_handler = self.__input_accept_handler
+class Producer:
+    def __init__(self, channel: AbstractChannel, queue_name: str, simple_input_mode: bool = False):
+        self.__channel = channel
+        self.__queue_name = queue_name
+        self.__simple_input_mode = simple_input_mode
 
-        kb = KeyBindings()
+    async def loop(self):
+        try:
+            tty.setcbreak(sys.stdin.fileno())
+        except termios.error as e:
+            print(f"{type(e)}: {e}")
+            print("Enabled simple input mode")
+            self.__simple_input_mode = True
 
-        @kb.add("c-q")
-        def _(event):
-            """ Pressing Ctrl-Q will exit the user interface. """
-            event.app.exit()
-            asyncio.create_task(self.connection.close())
+        await self.produce(const.PING)
 
-        style = Style(
-            [
-                ("output-field", "bg:#000044 #ffffff"),
-                ("input-field", "bg:#000000 #ffffff"),
-                ("line", "#004400"),
-            ]
-        )
+        while True:
+            inp: str = await self.getinput()
+            if inp == EXIT_KEY:
+                break
 
-        self.__app = Application(
-            layout=Layout(container, focused_element=input_field),
-            key_bindings=kb,
-            style=style,
-            mouse_support=True,
-            full_screen=True,
-        )
-        self.__outbuff = output_field.buffer
-        self.__inbuff = input_field.buffer
+            await self.produce(inp.encode())
 
-    def log(self, message: str):
-        new_text = self.__outbuff.text + message
-        self.__outbuff.document = Document(text=new_text, cursor_position=len(new_text))
+        await self.__channel.close()
+        print('close')
 
-    def __input_accept_handler(self, _):
-        command = self.__inbuff.text
-        self.log("\n>>> " + command + "\n")
-        asyncio.create_task(self.execute(command))
+    async def getinput(self) -> str:
+        if self.__simple_input_mode:
+            return await asyncio.to_thread(input) or '\n'
+        else:
+            return await asyncio.to_thread(readchar.readchar)
 
-    async def run(self):
-        await self.__app.run_async()
+    async def produce(self, data: bytes):
+        await short_pika.produce(self.__channel, self.__queue_name, data)
+
+
+async def log(message: bytes):
+    cprint = lambda *args, color: print(colorize(*args, color=color))
+
+    if message == const.EXIT:
+        cprint('\n# Executer is down\n', color=COLOR.WARNING)
+
+    elif message == const.PING:
+        cprint('# Executer start\n', color=COLOR.OKGREEN)
+
+    elif message == const.PONG:
+        cprint('# Executer is running\n', color=COLOR.OKCYAN)
+
+    else:
+        print(message.decode(), end='')
+        sys.stdout.flush()
 
 
 async def main():
-    async with ApplicationLogSender() as sender:
-        if not await sender.setup():
-            return
+    try:
+        room = sys.argv[1]
+    except IndexError:
+        print("Enter room name for connect")
+        return
 
-        await asyncio.gather(sender.consume(), sender.run())
+    connection, connected = await short_pika.connect(room)
+    if not connected:
+        return
+
+    connection: AbstractConnection
+    async with connection:
+        channel = await connection.channel()
+        await channel.declare_queue(PRODUCER_QUEUE)
+
+        prod = Producer(channel, PRODUCER_QUEUE)
+        cq = await channel.declare_queue(CONSUMER_QUEUE)
+        await cq.purge()
+
+        print('Wait executor...')
+        await asyncio.gather(short_pika.consume(cq, log), prod.loop())
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    if config.LOG:
+        logger.setfile('send.log')
+
+    try:
+        print('Press CTRL+L for exit\n')
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
+    finally:
+        logger.closefile()

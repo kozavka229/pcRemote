@@ -13,8 +13,8 @@ def api_root_view(request, *_, **kwargs):
     return Response({
         'new user': link("user-new"),
         'current user': link("user-current"),
-        'connect to room': link("user-connect"),
-        'rooms': link("room-list"),
+        "room's connects manage": link("user-connect"),
+        'rooms manage': link("room-list"),
     })
 
 class Router(routers.DefaultRouter):
@@ -30,5 +30,4 @@ urlpatterns = [
     path('user/new/', views.CreateUserView.as_view(), name="user-new"),
     path('user/', views.UserView.as_view(), name="user-current"),
     path('connect/', views.ConnectUserToRoomView.as_view(), name="user-connect"),
-    path('<str:method>/', views.endpoint),
 ]

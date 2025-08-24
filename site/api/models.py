@@ -1,6 +1,5 @@
 from django.contrib.auth.models import AbstractUser, UserManager
 from django.db import models
-from django.db.models.signals import post_delete, post_save
 
 from . import broker_api_tasks
 from config import settings
@@ -15,27 +14,57 @@ class ManagerSyncBroker(UserManager):
 class UserSyncBroker(AbstractUser):
     objects = ManagerSyncBroker()
 
-    @classmethod
-    def post_delete(cls, sender, instance, *__, **___):
-        broker_api_tasks.delete_user.delay(instance.id)
+    def delete(self, *args, **kwargs):
+        broker_api_tasks.delete_user.delay(self.pk)
+        super().delete(*args, **kwargs)
 
 
 class Room(models.Model):
+    objects = models.manager.Manager()
+
     name = models.CharField(max_length=32, unique=True)
     password = models.CharField(max_length=32)
 
     owner = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
 
-    @classmethod
-    async def post_save(cls, sender, instance, created, *__, **___):
+    class Meta:
+        ordering = ('-id',)
+
+    def save(self, *args, **kwargs):
+        created = self.pk is None
+
+        super().save(*args, **kwargs)
+
         if created:
-            broker_api_tasks.create_vhost_and_set_permission.delay(instance.id, instance.owner.id)
+            UserPermissionForRoom.objects.create(room=self, user=self.owner)
 
-    @classmethod
-    def post_delete(cls, sender, instance, *__, **___):
-        broker_api_tasks.delete_vhost.delay(instance.id)
+    def delete(self, *args, **kwargs):
+        broker_api_tasks.delete_vhost.delay(self.pk)
+        super().delete(*args, **kwargs)
+
+    def __str__(self):
+        return self.name
 
 
-post_save.connect(Room.post_save, sender=Room)
-post_delete.connect(Room.post_delete, sender=Room)
-post_delete.connect(UserSyncBroker.post_delete, sender=UserSyncBroker)
+class UserPermissionForRoom(models.Model):
+    objects = models.manager.Manager()
+
+    room = models.ForeignKey(Room, on_delete=models.CASCADE)
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
+
+    class Meta:
+        unique_together = ('room', 'user')
+        ordering = ('-id',)
+
+    def save(self, *args, **kwargs):
+        if self.pk:
+            old = self.__class__.objects.get(pk=self.pk)
+            if old.room != self.room or old.user != self.user:
+                broker_api_tasks.delete_permission.delay(old.room.id, old.user.id)
+
+        super().save(*args, **kwargs)
+        broker_api_tasks.create_vhost_and_set_permission.delay(self.room.pk, self.user.pk)
+
+    def delete(self, *args, **kwargs):
+        broker_api_tasks.delete_permission.delay(self.room.pk, self.user.pk)
+        super().delete(*args, **kwargs)

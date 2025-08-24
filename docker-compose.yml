@@ -7,7 +7,7 @@ services:
     ports:
       - "8000:8000"
     env_file:
-      - dev.env
+      - .env
 
   celery:
     build: ./site
@@ -18,7 +18,7 @@ services:
       - site
       - redis
     env_file:
-      - dev.env
+      - .env
 
   redis:
     image: redis:8.2-alpine

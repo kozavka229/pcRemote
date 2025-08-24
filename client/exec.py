@@ -1,86 +1,169 @@
 import asyncio
-import asyncio.subprocess as asubprocess
-from asyncio import Task
+import os
+import pty
+import signal
+import sys
 
-import aio_pika
+from aio_pika.abc import AbstractChannel
+
+from utils import colorize, COLOR, short_pika, logger, const
+from utils.buffer import RotationBuffer
 import config
-import commands
 
-PRODUCER_QUEUE = "logs"
-CONSUMER_QUEUE = "commands"
+PRODUCER_QUEUE = const.LOG_QUEUE
+CONSUMER_QUEUE = const.COMMANDS_QUEUE
 
-class CommandExecutor:
-    def __init__(self, channel):
-        self.__channel = channel
-        self.__proc: asubprocess.Process | None = None
-        self.__task: Task | None = None
+
+class Executor:
+    def __init__(self, buffer_max_size: int):
+        self.__child_pid = None
+        self.__fd = None
+        self.__running = False
+        self.__buffer = RotationBuffer(max_size=buffer_max_size)
 
     @property
-    def executed(self):
-        return self.__proc is not None
+    def is_running(self) -> bool:
+        return self.__running
 
-    async def execute(self, command: str):
-        if self.executed:
-            await self.log(f"\n\nERROR: Cannot execute \"{command}\" because executing another command\n\n\n".encode())
+    @property
+    def buffer(self) -> bytes:
+        return self.__buffer.get()
+
+    def setup(self):
+        if None not in (self.__child_pid, self.__fd):
+            raise RuntimeError("Double setup")
+
+        child_pid, fd = pty.fork()
+
+        if child_pid == 0:
+            os.execvp("bash", ["bash"])
+        else:
+            self.__child_pid = child_pid
+            self.__fd = fd
+            self.__running = True
+
+    def send(self, data: str | bytes):
+        if isinstance(data, str):
+            data = data.encode()
+
+        try:
+            os.write(self.__fd, data)
+            sys.stdin.flush()
+        except OSError as e:
+            self.__running = False
+            raise e
+
+    def read(self, length: int) -> bytes:
+        sys.stdout.flush()
+
+        try:
+            data = os.read(self.__fd, length)
+            self.__buffer.extend(data)
+            return data
+        except OSError as e:
+            self.__running = False
+            raise e
+
+    def close(self):
+        if self.__running:
+            os.kill(self.__child_pid, signal.SIGKILL)
+            os.close(self.__fd)
+            os.waitpid(self.__child_pid, 0)
+
+            self.__running = False
+            self.__fd = None
+            self.__child_pid = None
+
+    def __aenter__(self):
+        return self
+
+    def __aexit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+
+class ProducerExecutor:
+    def __init__(self, channel: AbstractChannel, queue_name: str, bytes_read: int, buffer_max_size: int):
+        super().__init__()
+
+        self.__channel = channel
+        self.__queue_name = queue_name
+        self.__bytes_read = bytes_read
+
+        self.__executor = Executor(buffer_max_size=buffer_max_size)
+
+    async def setup(self):
+        self.__executor.setup()
+        await self.log(const.PING)
+        await self.log_fd(self.__bytes_read)
+
+    async def send(self, data: bytes):
+        if data == const.PING:
+            await self.log(const.PONG)
+            await self.log(self.__executor.buffer)
             return
 
-        self.__task = asyncio.create_task(self.__execute_loop(command))
+        await asyncio.to_thread(self.__executor.send, data)
+        sys.stdin.flush()
 
-    async def __execute_loop(self, command: str):
-        print("execute:", command)
-        self.__proc = await asubprocess.create_subprocess_shell(command, stdin=asubprocess.PIPE,
-                                                                stdout=asubprocess.PIPE, stderr=asubprocess.STDOUT)
+    async def log(self, data: bytes):
+        await short_pika.produce(self.__channel, self.__queue_name, data)
 
-        while self.__proc.returncode is None:
-            output = await self.__proc.stdout.read(1024)
-            await self.log(output)
-            print(output)
+    async def log_fd(self, length: int):
+        try:
+            data = await asyncio.to_thread(self.__executor.read, length)
+        except OSError:
+            pass
+        else:
+            await self.log(data)
 
-        self.__proc = None
+    async def log_loop(self):
+        print(colorize("Running...", color=COLOR.OKGREEN))
+        while self.__executor.is_running:
+            await self.log_fd(self.__bytes_read)
 
-    async def log(self, message: bytes):
-        await self.__channel.default_exchange.publish(
-            aio_pika.Message(message),
-            routing_key=PRODUCER_QUEUE
-        )
+        await self.exit()
+        print(colorize("Stopped", color=COLOR.WARNING))
 
-    def send_signal(self, signal):
-        if not self.executed:
-            return
+    async def exit(self):
+        await asyncio.to_thread(self.__executor.close)
 
-        self.__proc.send_signal(signal)
+        if not self.__channel.is_closed:
+            await self.log(const.EXIT)
+            await self.__channel.close()
 
-async def producer(channel: aio_pika.abc.AbstractChannel):
-    await channel.declare_queue(PRODUCER_QUEUE)
+    async def __aenter__(self):
+        await self.setup()
+        return self
 
-async def consumer(channel: aio_pika.abc.AbstractChannel):
-    queue = await channel.declare_queue(CONSUMER_QUEUE)
-    async with queue.iterator() as queue_iter:
-        print("Wait commands...")
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        await self.exit()
 
-        executor = CommandExecutor(channel)
-
-        async for message in queue_iter:
-            async with message.process():
-                msg = message.body.decode()
-
-                if (signal := commands.check_signal_command(msg)) is not None:
-                    print("send signal")
-                    executor.send_signal(signal)
-                    continue
-
-                await executor.execute(msg)
 
 async def main():
-    connection, connected = await config.connect()
+    try:
+        room = sys.argv[1]
+    except IndexError:
+        print("Enter room name for connect")
+        return
+
+    connection, connected = await short_pika.connect(room)
     if not connected:
         return
 
     async with connection:
         channel = await connection.channel()
 
-        await asyncio.gather(consumer(channel), producer(channel))
+        cq = await channel.declare_queue(CONSUMER_QUEUE)
+        await cq.purge()
+
+        async with ProducerExecutor(channel, PRODUCER_QUEUE, const.BYTES_READ, const.BUFFER_MAX_SIZE) as executor:
+            await asyncio.gather(short_pika.consume(cq, executor.send), executor.log_loop())
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    if config.LOG:
+        logger.setfile('exec.log')
+
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
